@@ -2,15 +2,16 @@ package org.example;
 
 import jakarta.jms.Connection;
 import jakarta.jms.ConnectionFactory;
+import jakarta.jms.JMSException;
 import jakarta.jms.MessageProducer;
 import jakarta.jms.Queue;
-import jakarta.jms.QueueConnectionFactory;
 import jakarta.jms.Session;
 import jakarta.jms.TextMessage;
 import java.util.Properties;
 import javax.naming.Context;
 import javax.naming.InitialContext;
 import org.apache.activemq.artemis.jms.client.ActiveMQConnection;
+import org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory;
 
 public class Test {
 
@@ -23,6 +24,7 @@ public class Test {
         "(tcp://jms-0.artemis.esb.df.cloud:443,tcp://jms-1.artemis.esb.df.cloud:443)?"
         + "sslEnabled=true"       //соединение по ssl
         + "&clientID=TestJMS"     //id клиента
+        + "&clientFailureCheckPeriod=500" //сколько ждем соединения, прежде чем посчитать его умершим (ms)
         + "&ha=true" //Получение топологии сети кластера
         //Количество попыток подключения, если сервера недоступны. -1 - бесконечно. 0 - без попыток.
         //При указании 0 не будет работать переключение на следующий работающую ноды, если текущая лежит
@@ -47,33 +49,67 @@ public class Test {
     try {
 
       Context initialContext = new InitialContext(properties);
-      connectionFactory = (QueueConnectionFactory) initialContext.lookup("jms/TestJms/MainCF");
+      connectionFactory = (ConnectionFactory) initialContext.lookup("jms/TestJms/MainCF");
       queue = (Queue) initialContext.lookup("jms/TestJms/in");
+      ActiveMQConnectionFactory amqcf = (ActiveMQConnectionFactory)connectionFactory;
+      amqcf.setClientFailureCheckPeriod(500);
+      amqcf.setCallFailoverTimeout(500);
+      amqcf.setCallTimeout(500);
     } catch (Exception e) {
       throw new RuntimeException(
           "Can't lookup administrative objects because of " + e.getClass().getSimpleName() + ": " + e.getMessage(), e);
     }
+    Connection connection = null;
+    Session session = null;
+    MessageProducer messageProducer = null;
 
-    try (
-        Connection connection = connectionFactory.createConnection("admin", "admin!");
-        Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
-        MessageProducer messageProducer = session.createProducer(queue);
-    ) {
+    try {
       for (int i = 0; i < 1000; i++) {
-        String xml = "tru tu tu " + i;
-        TextMessage textMessage = session.createTextMessage(xml);
-        messageProducer.send(textMessage);
-        System.out.println("sended to:"+getRemoteAddress(connection)+"; text:"+xml);
-      }
+        while (true) {
+          if (connection == null) {
+            connection = connectionFactory.createConnection("admin", "admin!");
+            session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            messageProducer = session.createProducer(queue);
+          }
+          try {
+            String xml = "tru tu tu " + i;
+            TextMessage textMessage = session.createTextMessage(xml);
+            messageProducer.send(textMessage);
+            System.out.println("sended to:" + getRemoteAddress(connection) + "; text:" + xml);
+            break;
 
-    } catch (Exception e) {
-      throw new RuntimeException("Can't send event because of " + e.getClass().getSimpleName() + ": " + e.getMessage(),
-          e);
+          } catch (jakarta.jms.JMSException jmsEx) {
+            System.out.println("JMSException при отправке, пробую пересоздать соединение 😀: " + jmsEx.getMessage());
+            closeQuietly(messageProducer);
+            closeQuietly(session);
+            closeQuietly(connection);
+            messageProducer = null;
+            session = null;
+            connection = null;
+          }
+        }
+      }
+    } catch (JMSException e) {
+      throw new RuntimeException(e);
+    } finally {
+      closeQuietly(messageProducer);
+      closeQuietly(session);
+      closeQuietly(connection);
     }
   }
+
 
   private static String getRemoteAddress(Connection connection) {
     ActiveMQConnection amqConn = (ActiveMQConnection) connection;
     return amqConn.getSessionFactory().getConnection().getRemoteAddress();
+  }
+
+  private static void closeQuietly(AutoCloseable c) {
+    if (c != null) {
+      try {
+        c.close();
+      } catch (Exception ignore) {
+      }
+    }
   }
 }
